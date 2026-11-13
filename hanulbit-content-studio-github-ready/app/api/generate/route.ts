@@ -1,3 +1,4 @@
+
 import { NextResponse } from "next/server";
 import { GoogleGenAI } from "@google/genai";
 
@@ -13,42 +14,97 @@ type ProjectInfo = {
 
 const MAX_IMAGES = 8;
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
+const MAX_RETRIES = 3;
 
-// 보안: 우리 Supabase 저장소에 올라간 사진 주소만 허용합니다.
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+function errorStatus(error: unknown): number | undefined {
+  const e = error as {
+    status?: number;
+    code?: number | string;
+    error?: { status?: string; code?: number };
+  };
+
+  if (typeof e?.status === "number") return e.status;
+  if (typeof e?.code === "number") return e.code;
+
+  const message = errorText(error);
+  const match = message.match(/\b(429|500|502|503|504)\b/);
+
+  return match ? Number(match[1]) : undefined;
+}
+
+function isTemporaryError(error: unknown): boolean {
+  const message = errorText(error).toUpperCase();
+  const status = errorStatus(error);
+
+  return (
+    [429, 500, 502, 503, 504].includes(status || 0) ||
+    /UNAVAILABLE|RESOURCE_EXHAUSTED|INTERNAL|DEADLINE_EXCEEDED|HIGH DEMAND|OVERLOADED/.test(message)
+  );
+}
+
 function isAllowedImageUrl(raw: string): boolean {
   try {
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
     if (!supabaseUrl) return false;
+
     const u = new URL(raw);
     const allowedHost = new URL(supabaseUrl).hostname;
-    return u.protocol === "https:" && u.hostname === allowedHost && u.pathname.startsWith("/storage/");
+
+    return (
+      u.protocol === "https:" &&
+      u.hostname === allowedHost &&
+      u.pathname.startsWith("/storage/")
+    );
   } catch {
     return false;
   }
 }
 
 function guessMimeType(url: string, headerType: string | null): string {
-  const fromHeader = (headerType || "").split(";")[0].trim().toLowerCase();
+  const fromHeader = (headerType || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+
   if (fromHeader.startsWith("image/")) return fromHeader;
+
   const lower = url.split("?")[0].toLowerCase();
+
   if (lower.endsWith(".png")) return "image/png";
   if (lower.endsWith(".webp")) return "image/webp";
+
   return "image/jpeg";
 }
 
-// Gemini는 인터넷 주소의 사진을 직접 읽지 못하므로, 서버가 내려받아 데이터로 전달합니다.
 async function toInlinePart(url: string) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`사진을 불러오지 못했습니다 (${res.status})`);
-  const buffer = Buffer.from(await res.arrayBuffer());
-  if (buffer.length > MAX_IMAGE_BYTES) {
-    throw new Error("사진 한 장의 크기가 너무 큽니다. 6MB 이하로 줄여 주세요.");
+
+  if (!res.ok) {
+    throw new Error(`사진을 불러오지 못했습니다 (${res.status})`);
   }
+
+  const buffer = Buffer.from(await res.arrayBuffer());
+
+  if (buffer.length > MAX_IMAGE_BYTES) {
+    throw new Error(
+      "사진 한 장의 크기가 너무 큽니다. 6MB 이하로 줄여 주세요."
+    );
+  }
+
   return {
     inlineData: {
       mimeType: guessMimeType(url, res.headers.get("content-type")),
-      data: buffer.toString("base64")
-    }
+      data: buffer.toString("base64"),
+    },
   };
 }
 
@@ -57,12 +113,56 @@ function parseJson(raw: string) {
     .trim()
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/, "");
+
   return JSON.parse(cleaned);
+}
+
+// 일시적인 Gemini 장애에 자동으로 재시도합니다.
+async function generateWithRetry(
+  ai: GoogleGenAI,
+  model: string,
+  contents: any[],
+  config: any,
+  attempts = MAX_RETRIES
+) {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      console.log(
+        `Gemini 요청: ${model} (${attempt}/${attempts})`
+      );
+
+      return await ai.models.generateContent({
+        model,
+        contents,
+        config,
+      });
+    } catch (error) {
+      lastError = error;
+
+      if (!isTemporaryError(error) || attempt === attempts) {
+        throw error;
+      }
+
+      const delay = 1000 * Math.pow(2, attempt - 1);
+
+      console.warn(
+        `Gemini 일시 오류. ${delay}ms 후 재시도합니다.`,
+        errorText(error)
+      );
+
+      await sleep(delay);
+    }
+  }
+
+  throw lastError;
 }
 
 export async function POST(request: Request) {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
+
     if (!apiKey) {
       return NextResponse.json(
         { error: "서버에 GEMINI_API_KEY 환경변수가 설정되지 않았습니다." },
@@ -72,18 +172,28 @@ export async function POST(request: Request) {
 
     const body = await request.json();
     const project = (body.project || {}) as ProjectInfo;
+
     const imageUrls: string[] = Array.isArray(body.imageUrls)
       ? body.imageUrls
-          .filter((url: unknown): url is string => typeof url === "string" && isAllowedImageUrl(url))
+          .filter(
+            (url: unknown): url is string =>
+              typeof url === "string" && isAllowedImageUrl(url)
+          )
           .slice(0, MAX_IMAGES)
       : [];
 
     if (imageUrls.length === 0) {
-      return NextResponse.json({ error: "분석할 사진이 없습니다." }, { status: 400 });
+      return NextResponse.json(
+        { error: "분석할 사진이 없습니다." },
+        { status: 400 }
+      );
     }
 
     const ai = new GoogleGenAI({ apiKey });
-    const imageParts = await Promise.all(imageUrls.map((url) => toInlinePart(url)));
+
+    const imageParts = await Promise.all(
+      imageUrls.map((url) => toInlinePart(url))
+    );
 
     const prompt = `
 당신은 부산·경남 창호 전문 시공업체 '하늘빛창호'의 콘텐츠 에디터입니다.
@@ -112,27 +222,93 @@ export async function POST(request: Request) {
 }
 `;
 
-    const response = await ai.models.generateContent({
-      model: process.env.GEMINI_MODEL || "gemini-flash-latest",
-      contents: [{ role: "user", parts: [{ text: prompt }, ...imageParts] }],
-      config: {
-        systemInstruction: "정확하고 신중한 한국어 브랜드 콘텐츠 작성자입니다. 지정된 JSON만 반환합니다.",
-        responseMimeType: "application/json",
-        temperature: 0.7
+    const contents = [
+      {
+        role: "user",
+        parts: [{ text: prompt }, ...imageParts],
+      },
+    ];
+
+    const config = {
+      systemInstruction:
+        "정확하고 신중한 한국어 브랜드 콘텐츠 작성자입니다. 지정된 JSON만 반환합니다.",
+      responseMimeType: "application/json",
+      temperature: 0.7,
+    };
+
+    const primaryModel =
+      process.env.GEMINI_MODEL || "gemini-flash-latest";
+
+    const fallbackModel = process.env.GEMINI_FALLBACK_MODEL;
+
+    let response;
+
+    try {
+      response = await generateWithRetry(
+        ai,
+        primaryModel,
+        contents,
+        config
+      );
+    } catch (primaryError) {
+      if (
+        !fallbackModel ||
+        fallbackModel === primaryModel ||
+        !isTemporaryError(primaryError)
+      ) {
+        throw primaryError;
       }
-    });
+
+      console.warn(
+        `기본 모델 실패. 대체 모델로 전환합니다: ${fallbackModel}`
+      );
+
+      response = await generateWithRetry(
+        ai,
+        fallbackModel,
+        contents,
+        config,
+        2
+      );
+    }
 
     const raw = response.text;
-    if (!raw) throw new Error("AI 응답이 비어 있습니다.");
+
+    if (!raw) {
+      throw new Error("AI 응답이 비어 있습니다.");
+    }
+
     const content = parseJson(raw);
+
     return NextResponse.json({ content });
   } catch (error) {
     console.error("Content generation error:", error);
-    const message = error instanceof Error ? error.message : "콘텐츠 생성 중 오류가 발생했습니다.";
-    const friendly =
-      /429|quota|RESOURCE_EXHAUSTED/i.test(message)
-        ? "AI 사용 한도에 도달했습니다. 잠시 후 다시 시도해 주세요."
-        : message;
-    return NextResponse.json({ error: friendly }, { status: 500 });
+
+    const message = errorText(error);
+    const status = errorStatus(error);
+
+    if (isTemporaryError(error)) {
+      const isQuota = status === 429 ||
+        /QUOTA|RESOURCE_EXHAUSTED/i.test(message);
+
+      return NextResponse.json(
+        {
+          error: isQuota
+            ? "AI 사용량이 일시적으로 많습니다. 잠시 후 다시 시도해 주세요."
+            : "Google Gemini 서버가 일시적으로 혼잡합니다. 잠시 후 다시 시도해 주세요.",
+          retryable: true,
+        },
+        { status: isQuota ? 429 : 503 }
+      );
+    }
+
+    return NextResponse.json(
+      {
+        error:
+          message || "콘텐츠 생성 중 오류가 발생했습니다.",
+        retryable: false,
+      },
+      { status: 500 }
+    );
   }
 }
