@@ -44,6 +44,9 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [draftId, setDraftId] = useState<string | null>(null);
+  const [instagramConnected, setInstagramConnected] = useState(false);
+  const [instagramAccount, setInstagramAccount] = useState<string | null>(null);
+  const [publishing, setPublishing] = useState(false);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -107,6 +110,24 @@ export default function Home() {
     if (!error && data) {
       setDrafts(data as Draft[]);
     }
+  }
+
+  async function convertToJpeg(source: File): Promise<File> {
+    const bitmap = await createImageBitmap(source);
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("사진 변환을 시작할 수 없습니다.");
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(bitmap, 0, 0);
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((value) => value ? resolve(value) : reject(new Error("JPG 변환에 실패했습니다.")), "image/jpeg", 0.92);
+      });
+      return new File([blob], source.name.replace(/\.[^.]+$/, "") + ".jpg", { type: "image/jpeg", lastModified: Date.now() });
+    } finally { bitmap.close(); }
   }
 
   async function generate() {
@@ -402,6 +423,10 @@ export default function Home() {
         </div>
 
         <div className="statusPill">검토 후 승인 게시</div>
+        <div className="socialConnect">
+          <span>{instagramConnected ? `Instagram 연결됨 ${instagramAccount ? "@" + instagramAccount : ""}` : "Instagram 계정 미연결"}</span>
+          <button className="ghost small" disabled={busy} onClick={connectInstagram}>{instagramConnected ? "계정 다시 연결" : "인스타그램 계정 연결"}</button>
+        </div>
       </section>
 
       <div className="layout">
