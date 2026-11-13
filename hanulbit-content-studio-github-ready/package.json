@@ -9,9 +9,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@google/genai": "^1.0.0",
     "@supabase/supabase-js": "^2.49.1",
     "next": "^15.2.0",
-    "openai": "^4.85.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
