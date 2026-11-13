@@ -14,7 +14,19 @@ type ProjectInfo = {
 
 const MAX_IMAGES = 8;
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
-const MAX_RETRIES = 3;
+
+// 사진 한 장 다운로드 최대 20초
+const IMAGE_TIMEOUT_MS = 20_000;
+
+// Gemini 요청 한 번당 최대 85초
+const GEMINI_TIMEOUT_MS = 85_000;
+
+// 최초 요청 포함 최대 2회
+const MAX_RETRIES = 2;
+
+function elapsed(start: number) {
+  return `${Date.now() - start}ms`;
+}
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -47,7 +59,9 @@ function isTemporaryError(error: unknown): boolean {
 
   return (
     [429, 500, 502, 503, 504].includes(status || 0) ||
-    /UNAVAILABLE|RESOURCE_EXHAUSTED|INTERNAL|DEADLINE_EXCEEDED|HIGH DEMAND|OVERLOADED/.test(message)
+    /UNAVAILABLE|RESOURCE_EXHAUSTED|INTERNAL|DEADLINE_EXCEEDED|HIGH DEMAND|OVERLOADED|TIMEOUT|TIMED OUT|ABORTED|ABORTERROR/.test(
+      message
+    )
   );
 }
 
@@ -69,7 +83,10 @@ function isAllowedImageUrl(raw: string): boolean {
   }
 }
 
-function guessMimeType(url: string, headerType: string | null): string {
+function guessMimeType(
+  url: string,
+  headerType: string | null
+): string {
   const fromHeader = (headerType || "")
     .split(";")[0]
     .trim()
@@ -85,27 +102,74 @@ function guessMimeType(url: string, headerType: string | null): string {
   return "image/jpeg";
 }
 
-async function toInlinePart(url: string) {
-  const res = await fetch(url);
+// 사진 다운로드에 개별 시간 제한 적용
+async function toInlinePart(url: string, index: number) {
+  const started = Date.now();
 
-  if (!res.ok) {
-    throw new Error(`사진을 불러오지 못했습니다 (${res.status})`);
-  }
+  try {
+    console.log(`[사진 ${index + 1}] 다운로드 시작`);
 
-  const buffer = Buffer.from(await res.arrayBuffer());
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(IMAGE_TIMEOUT_MS),
+      cache: "no-store",
+    });
 
-  if (buffer.length > MAX_IMAGE_BYTES) {
-    throw new Error(
-      "사진 한 장의 크기가 너무 큽니다. 6MB 이하로 줄여 주세요."
+    if (!res.ok) {
+      throw new Error(
+        `사진 ${index + 1} 다운로드 실패: HTTP ${res.status}`
+      );
+    }
+
+    const contentLength = Number(
+      res.headers.get("content-length") || 0
     );
-  }
 
-  return {
-    inlineData: {
-      mimeType: guessMimeType(url, res.headers.get("content-type")),
-      data: buffer.toString("base64"),
-    },
-  };
+    if (contentLength > MAX_IMAGE_BYTES) {
+      throw new Error(
+        `사진 ${index + 1}의 크기가 6MB를 초과합니다.`
+      );
+    }
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+
+    if (buffer.length > MAX_IMAGE_BYTES) {
+      throw new Error(
+        `사진 ${index + 1}의 크기가 6MB를 초과합니다.`
+      );
+    }
+
+    console.log(
+      `[사진 ${index + 1}] 다운로드 완료: ${elapsed(started)}, ${Math.round(
+        buffer.length / 1024
+      )}KB`
+    );
+
+    return {
+      inlineData: {
+        mimeType: guessMimeType(
+          url,
+          res.headers.get("content-type")
+        ),
+        data: buffer.toString("base64"),
+      },
+    };
+  } catch (error) {
+    console.error(
+      `[사진 ${index + 1}] 다운로드 오류 (${elapsed(started)}):`,
+      errorText(error)
+    );
+
+    if (
+      error instanceof Error &&
+      error.name === "TimeoutError"
+    ) {
+      throw new Error(
+        `사진 ${index + 1} 다운로드 시간이 초과됐습니다. 잠시 후 다시 시도해 주세요.`
+      );
+    }
+
+    throw error;
+  }
 }
 
 function parseJson(raw: string) {
@@ -117,42 +181,64 @@ function parseJson(raw: string) {
   return JSON.parse(cleaned);
 }
 
-// 일시적인 Gemini 장애에 자동으로 재시도합니다.
+// Gemini 요청 시간 제한 및 재시도
 async function generateWithRetry(
   ai: GoogleGenAI,
   model: string,
   contents: any[],
-  config: any,
-  attempts = MAX_RETRIES
+  config: any
 ) {
   let lastError: unknown;
 
-  for (let attempt = 1; attempt <= attempts; attempt++) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const started = Date.now();
+
     try {
       console.log(
-        `Gemini 요청: ${model} (${attempt}/${attempts})`
+        `[Gemini] 요청 시작: ${model}, ${attempt}/${MAX_RETRIES}`
       );
 
-      return await ai.models.generateContent({
+      const response = await ai.models.generateContent({
         model,
         contents,
-        config,
+        config: {
+          ...config,
+          httpOptions: {
+            timeout: GEMINI_TIMEOUT_MS,
+
+            // SDK 자체의 기본 재시도와 중복되지 않도록 설정
+            retryOptions: {
+              attempts: 1,
+            },
+          },
+        },
       });
+
+      console.log(
+        `[Gemini] 응답 완료: ${elapsed(started)}`
+      );
+
+      return response;
     } catch (error) {
       lastError = error;
 
-      if (!isTemporaryError(error) || attempt === attempts) {
-        throw error;
-      }
-
-      const delay = 1000 * Math.pow(2, attempt - 1);
-
-      console.warn(
-        `Gemini 일시 오류. ${delay}ms 후 재시도합니다.`,
+      console.error(
+        `[Gemini] 요청 실패 (${elapsed(started)}):`,
         errorText(error)
       );
 
-      await sleep(delay);
+      if (
+        !isTemporaryError(error) ||
+        attempt === MAX_RETRIES
+      ) {
+        throw error;
+      }
+
+      console.warn(
+        "[Gemini] 일시 오류. 2초 후 한 번 더 시도합니다."
+      );
+
+      await sleep(2000);
     }
   }
 
@@ -160,12 +246,19 @@ async function generateWithRetry(
 }
 
 export async function POST(request: Request) {
+  const totalStarted = Date.now();
+
   try {
+    console.log("[생성] 요청 접수");
+
     const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
       return NextResponse.json(
-        { error: "서버에 GEMINI_API_KEY 환경변수가 설정되지 않았습니다." },
+        {
+          error:
+            "서버에 GEMINI_API_KEY 환경변수가 설정되지 않았습니다.",
+        },
         { status: 500 }
       );
     }
@@ -177,7 +270,8 @@ export async function POST(request: Request) {
       ? body.imageUrls
           .filter(
             (url: unknown): url is string =>
-              typeof url === "string" && isAllowedImageUrl(url)
+              typeof url === "string" &&
+              isAllowedImageUrl(url)
           )
           .slice(0, MAX_IMAGES)
       : [];
@@ -189,10 +283,20 @@ export async function POST(request: Request) {
       );
     }
 
-    const ai = new GoogleGenAI({ apiKey });
+    console.log(
+      `[생성] 사진 ${imageUrls.length}장 처리 시작`
+    );
+
+    const imageStarted = Date.now();
 
     const imageParts = await Promise.all(
-      imageUrls.map((url) => toInlinePart(url))
+      imageUrls.map((url, index) =>
+        toInlinePart(url, index)
+      )
+    );
+
+    console.log(
+      `[생성] 사진 전체 처리 완료: ${elapsed(imageStarted)}`
     );
 
     const prompt = `
@@ -234,43 +338,24 @@ export async function POST(request: Request) {
         "정확하고 신중한 한국어 브랜드 콘텐츠 작성자입니다. 지정된 JSON만 반환합니다.",
       responseMimeType: "application/json",
       temperature: 0.7,
+      maxOutputTokens: 4096,
     };
 
-    const primaryModel =
+    const model =
       process.env.GEMINI_MODEL || "gemini-flash-latest";
 
-    const fallbackModel = process.env.GEMINI_FALLBACK_MODEL;
+    // SDK의 HTTP 요청 시간 제한은 85초
+    // 최대 2회 요청하므로 5분 제한에 접근하지 않도록 구성
+    const ai = new GoogleGenAI({ apiKey });
 
-    let response;
+    console.log(`[생성] Gemini 모델: ${model}`);
 
-    try {
-      response = await generateWithRetry(
-        ai,
-        primaryModel,
-        contents,
-        config
-      );
-    } catch (primaryError) {
-      if (
-        !fallbackModel ||
-        fallbackModel === primaryModel ||
-        !isTemporaryError(primaryError)
-      ) {
-        throw primaryError;
-      }
-
-      console.warn(
-        `기본 모델 실패. 대체 모델로 전환합니다: ${fallbackModel}`
-      );
-
-      response = await generateWithRetry(
-        ai,
-        fallbackModel,
-        contents,
-        config,
-        2
-      );
-    }
+    const response = await generateWithRetry(
+      ai,
+      model,
+      contents,
+      config
+    );
 
     const raw = response.text;
 
@@ -280,22 +365,37 @@ export async function POST(request: Request) {
 
     const content = parseJson(raw);
 
+    console.log(
+      `[생성] 전체 완료: ${elapsed(totalStarted)}`
+    );
+
     return NextResponse.json({ content });
   } catch (error) {
-    console.error("Content generation error:", error);
+    console.error(
+      `[생성] 전체 실패 (${elapsed(totalStarted)}):`,
+      error
+    );
 
     const message = errorText(error);
     const status = errorStatus(error);
 
     if (isTemporaryError(error)) {
-      const isQuota = status === 429 ||
+      const isQuota =
+        status === 429 ||
         /QUOTA|RESOURCE_EXHAUSTED/i.test(message);
+
+      const isTimeout =
+        /TIMEOUT|TIMED OUT|ABORTED|ABORTERROR|DEADLINE_EXCEEDED/i.test(
+          message
+        );
 
       return NextResponse.json(
         {
-          error: isQuota
-            ? "AI 사용량이 일시적으로 많습니다. 잠시 후 다시 시도해 주세요."
-            : "Google Gemini 서버가 일시적으로 혼잡합니다. 잠시 후 다시 시도해 주세요.",
+          error: isTimeout
+            ? "AI 응답 시간이 초과됐습니다. 사진 수를 줄이거나 잠시 후 다시 시도해 주세요."
+            : isQuota
+              ? "AI 사용량이 일시적으로 많습니다. 잠시 후 다시 시도해 주세요."
+              : "Google Gemini 서버가 일시적으로 혼잡합니다. 잠시 후 다시 시도해 주세요.",
           retryable: true,
         },
         { status: isQuota ? 429 : 503 }
