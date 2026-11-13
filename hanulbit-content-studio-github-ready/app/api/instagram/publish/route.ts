@@ -29,6 +29,18 @@ export async function POST(request: Request) {
     if (draftError || !draft) return NextResponse.json({ error: "저장된 콘텐츠를 찾을 수 없습니다." }, { status: 404 });
     if (draft.status !== "approved") return NextResponse.json({ error: "검토 완료 후 승인된 콘텐츠만 게시할 수 있습니다." }, { status: 409 });
 
+    const { data: alreadyPublished, error: alreadyError } = await admin.from("content_publications")
+      .select("id,permalink")
+      .eq("user_id", user.id)
+      .eq("content_item_id", draft.id)
+      .eq("platform", "instagram")
+      .eq("status", "published")
+      .maybeSingle();
+    if (alreadyError) throw new Error(alreadyError.message);
+    if (alreadyPublished) {
+      return NextResponse.json({ error: "이 콘텐츠는 이미 인스타그램에 게시됐습니다.", permalink: alreadyPublished.permalink }, { status: 409 });
+    }
+
     const imageUrl = draft.image_urls?.[0];
     if (!imageUrl) return NextResponse.json({ error: "게시할 시공 사진이 없습니다." }, { status: 400 });
     const parsedImage = new URL(imageUrl);
@@ -52,6 +64,21 @@ export async function POST(request: Request) {
       caption,
     }, token);
     if (!container.id) throw new Error("Instagram 게시 컨테이너를 생성하지 못했습니다.");
+
+    let containerStatus = "IN_PROGRESS";
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const statusUrl = new URL(`https://graph.instagram.com/${graphVersion}/${container.id}`);
+      statusUrl.searchParams.set("fields", "status_code");
+      statusUrl.searchParams.set("access_token", token);
+      const statusResponse = await fetch(statusUrl, { signal: AbortSignal.timeout(12000) });
+      const statusJson = await statusResponse.json();
+      if (!statusResponse.ok || statusJson.error) throw new Error(statusJson.error?.message || "Instagram 사진 처리 상태를 확인하지 못했습니다.");
+      containerStatus = statusJson.status_code || "IN_PROGRESS";
+      if (containerStatus === "FINISHED") break;
+      if (containerStatus === "ERROR" || containerStatus === "EXPIRED") throw new Error("Instagram에서 사진을 처리하지 못했습니다. 사진을 다시 업로드해 주세요.");
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    if (containerStatus !== "FINISHED") throw new Error("Instagram 사진 처리가 지연되고 있습니다. 잠시 후 다시 시도해 주세요.");
 
     const published = await graphPost(`${connection.account_id}/media_publish`, {
       creation_id: String(container.id),
