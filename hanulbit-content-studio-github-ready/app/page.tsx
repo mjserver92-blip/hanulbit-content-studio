@@ -112,6 +112,27 @@ export default function Home() {
     }
   }
 
+  async function convertToJpeg(source: File): Promise<File> {
+    const bitmap = await createImageBitmap(source);
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("사진 변환을 시작할 수 없습니다.");
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(bitmap, 0, 0);
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((value) => value ? resolve(value) : reject(new Error("JPG 변환에 실패했습니다.")), "image/jpeg", 0.92);
+      });
+      const name = source.name.replace(/\.[^.]+$/, "") + ".jpg";
+      return new File([blob], name, { type: "image/jpeg", lastModified: Date.now() });
+    } finally {
+      bitmap.close();
+    }
+  }
+
   async function generate() {
     if (!user) {
       setMessage("로그인이 필요합니다.");
