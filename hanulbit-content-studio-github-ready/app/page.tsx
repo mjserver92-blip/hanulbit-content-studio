@@ -116,15 +116,16 @@ export default function Home() {
     const bitmap = await createImageBitmap(source);
     try {
       const canvas = document.createElement("canvas");
-      canvas.width = bitmap.width;
-      canvas.height = bitmap.height;
+      const scale = Math.min(1, 1440 / Math.max(bitmap.width, bitmap.height));
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
       const context = canvas.getContext("2d");
       if (!context) throw new Error("사진 변환을 시작할 수 없습니다.");
       context.fillStyle = "#ffffff";
       context.fillRect(0, 0, canvas.width, canvas.height);
       context.drawImage(bitmap, 0, 0);
       const blob = await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob((value) => value ? resolve(value) : reject(new Error("JPG 변환에 실패했습니다.")), "image/jpeg", 0.92);
+        canvas.toBlob((value) => value ? resolve(value) : reject(new Error("JPG 변환에 실패했습니다.")), "image/jpeg", 0.86);
       });
       return new File([blob], source.name.replace(/\.[^.]+$/, "") + ".jpg", { type: "image/jpeg", lastModified: Date.now() });
     } finally { bitmap.close(); }
