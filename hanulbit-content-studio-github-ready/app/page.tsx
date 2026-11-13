@@ -44,6 +44,9 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [draftId, setDraftId] = useState<string | null>(null);
+  const [instagramConnected, setInstagramConnected] = useState(false);
+  const [instagramAccount, setInstagramAccount] = useState<string | null>(null);
+  const [publishing, setPublishing] = useState(false);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -402,6 +405,12 @@ export default function Home() {
         </div>
 
         <div className="statusPill">검토 후 승인 게시</div>
+        <div className="socialConnect">
+          <span>{instagramConnected ? `Instagram 연결됨 ${instagramAccount ? "@" + instagramAccount : ""}` : "Instagram 계정 미연결"}</span>
+          <button className="ghost small" disabled={busy} onClick={connectInstagram}>
+            {instagramConnected ? "계정 다시 연결" : "인스타그램 계정 연결"}
+          </button>
+        </div>
       </section>
 
       <div className="layout">
