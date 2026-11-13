@@ -63,5 +63,5 @@ export function verifyState(state: string) {
   return payload as { userId: string; exp: number };
 }
 
-export const graphVersion = process.env.META_GRAPH_VERSION || "v26.0";
+export const graphVersion = process.env.META_GRAPH_VERSION || "v27.0";
 export const appUrl = process.env.NEXT_PUBLIC_APP_URL || "https://hanulbit-studio.vercel.app";
