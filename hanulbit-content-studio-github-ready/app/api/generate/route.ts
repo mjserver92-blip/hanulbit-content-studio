@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
-import OpenAI from "openai";
+import { GoogleGenAI } from "@google/genai";
 
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
 type ProjectInfo = {
   site?: string;
@@ -10,29 +11,80 @@ type ProjectInfo = {
   notes?: string;
 };
 
+const MAX_IMAGES = 8;
+const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
+
+// 보안: 우리 Supabase 저장소에 올라간 사진 주소만 허용합니다.
+function isAllowedImageUrl(raw: string): boolean {
+  try {
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    if (!supabaseUrl) return false;
+    const u = new URL(raw);
+    const allowedHost = new URL(supabaseUrl).hostname;
+    return u.protocol === "https:" && u.hostname === allowedHost && u.pathname.startsWith("/storage/");
+  } catch {
+    return false;
+  }
+}
+
+function guessMimeType(url: string, headerType: string | null): string {
+  const fromHeader = (headerType || "").split(";")[0].trim().toLowerCase();
+  if (fromHeader.startsWith("image/")) return fromHeader;
+  const lower = url.split("?")[0].toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".webp")) return "image/webp";
+  return "image/jpeg";
+}
+
+// Gemini는 인터넷 주소의 사진을 직접 읽지 못하므로, 서버가 내려받아 데이터로 전달합니다.
+async function toInlinePart(url: string) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`사진을 불러오지 못했습니다 (${res.status})`);
+  const buffer = Buffer.from(await res.arrayBuffer());
+  if (buffer.length > MAX_IMAGE_BYTES) {
+    throw new Error("사진 한 장의 크기가 너무 큽니다. 6MB 이하로 줄여 주세요.");
+  }
+  return {
+    inlineData: {
+      mimeType: guessMimeType(url, res.headers.get("content-type")),
+      data: buffer.toString("base64")
+    }
+  };
+}
+
+function parseJson(raw: string) {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
+  return JSON.parse(cleaned);
+}
+
 export async function POST(request: Request) {
   try {
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       return NextResponse.json(
-        { error: "서버에 OPENAI_API_KEY 환경변수가 설정되지 않았습니다." },
+        { error: "서버에 GEMINI_API_KEY 환경변수가 설정되지 않았습니다." },
         { status: 500 }
       );
     }
 
     const body = await request.json();
     const project = (body.project || {}) as ProjectInfo;
-    const imageUrls = Array.isArray(body.imageUrls)
-      ? body.imageUrls.filter((url: unknown): url is string =>
-          typeof url === "string" && /^https:\/\/.+/i.test(url)
-        ).slice(0, 8)
+    const imageUrls: string[] = Array.isArray(body.imageUrls)
+      ? body.imageUrls
+          .filter((url: unknown): url is string => typeof url === "string" && isAllowedImageUrl(url))
+          .slice(0, MAX_IMAGES)
       : [];
 
     if (imageUrls.length === 0) {
       return NextResponse.json({ error: "분석할 사진이 없습니다." }, { status: 400 });
     }
 
-    const openai = new OpenAI({ apiKey });
+    const ai = new GoogleGenAI({ apiKey });
+    const imageParts = await Promise.all(imageUrls.map((url) => toInlinePart(url)));
+
     const prompt = `
 당신은 부산·경남 창호 전문 시공업체 '하늘빛창호'의 콘텐츠 에디터입니다.
 업로드된 실제 시공 사진과 아래 현장 정보를 바탕으로 채널별 게시물 초안을 한국어로 작성하세요.
@@ -60,32 +112,27 @@ export async function POST(request: Request) {
 }
 `;
 
-    const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: "정확하고 신중한 한국어 브랜드 콘텐츠 작성자입니다. 지정된 JSON만 반환합니다." },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            ...imageUrls.map((url: string) => ({
-              type: "image_url" as const,
-              image_url: { url, detail: "high" as const }
-            }))
-          ]
-        }
-      ],
-      temperature: 0.7
+    const response = await ai.models.generateContent({
+      model: process.env.GEMINI_MODEL || "gemini-flash-latest",
+      contents: [{ role: "user", parts: [{ text: prompt }, ...imageParts] }],
+      config: {
+        systemInstruction: "정확하고 신중한 한국어 브랜드 콘텐츠 작성자입니다. 지정된 JSON만 반환합니다.",
+        responseMimeType: "application/json",
+        temperature: 0.7
+      }
     });
 
-    const raw = response.choices[0]?.message?.content;
+    const raw = response.text;
     if (!raw) throw new Error("AI 응답이 비어 있습니다.");
-    const content = JSON.parse(raw);
+    const content = parseJson(raw);
     return NextResponse.json({ content });
   } catch (error) {
     console.error("Content generation error:", error);
     const message = error instanceof Error ? error.message : "콘텐츠 생성 중 오류가 발생했습니다.";
-    return NextResponse.json({ error: message }, { status: 500 });
+    const friendly =
+      /429|quota|RESOURCE_EXHAUSTED/i.test(message)
+        ? "AI 사용 한도에 도달했습니다. 잠시 후 다시 시도해 주세요."
+        : message;
+    return NextResponse.json({ error: friendly }, { status: 500 });
   }
 }
